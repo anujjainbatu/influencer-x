@@ -130,11 +130,16 @@ function DrivePicker() {
   );
 }
 
+// 4 MB per chunk — well under Vercel Edge's 4.5 MB body limit.
+// Must be a multiple of 256 KB per the Drive resumable upload spec.
+const CHUNK_SIZE = 4 * 1024 * 1024; // 4,194,304 bytes
+
 function DeviceUploader() {
   const router = useRouter();
   const [file, setFile] = useState<File | null>(null);
   const [progress, setProgress] = useState(0);
   const [uploading, setUploading] = useState(false);
+  const [status, setStatus] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const upload = async () => {
@@ -142,13 +147,14 @@ function DeviceUploader() {
     setError(null);
     setUploading(true);
     setProgress(0);
+    setStatus("Preparing…");
     try {
-      // Upload the file to our own API endpoint (same-origin, no CORS).
-      // Our Edge function proxies the bytes to Google Drive server-side.
-      // XHR is used so we get real upload progress to our server.
-      const driveFile = await uploadViaOurProxy(file, (p) => setProgress(p));
+      const driveFile = await chunkedUpload(file, (p, s) => {
+        setProgress(p);
+        setStatus(s);
+      });
 
-      // Register the Drive file in our DB.
+      setStatus("Registering…");
       const reg = await fetch("/api/videos", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -169,6 +175,7 @@ function DeviceUploader() {
       setError(e instanceof Error ? e.message : "Upload failed");
     } finally {
       setUploading(false);
+      setStatus("");
     }
   };
 
@@ -176,7 +183,7 @@ function DeviceUploader() {
     <Card className="space-y-4">
       <CardTitle>Upload from your device</CardTitle>
       <CardDescription>
-        Your file is uploaded to your Google Drive. We proxy it server-side so you get a clean progress bar with no CORS noise.
+        The file uploads in 4 MB chunks through our server into your Google Drive. Works for any file size.
       </CardDescription>
       <Input
         type="file"
@@ -184,7 +191,7 @@ function DeviceUploader() {
         onChange={(e) => setFile(e.target.files?.[0] ?? null)}
         disabled={uploading}
       />
-      {file && (
+      {file && !uploading && (
         <p className="text-sm text-foreground/60">
           {file.name} · {(file.size / (1024 * 1024)).toFixed(1)} MB
         </p>
@@ -197,7 +204,7 @@ function DeviceUploader() {
               style={{ width: `${progress}%` }}
             />
           </div>
-          <p className="text-xs text-foreground/60">Uploading to Drive… {progress}%</p>
+          <p className="text-xs text-foreground/60">{status} {progress}%</p>
         </div>
       )}
       {error && <p className="text-sm text-red-500">{error}</p>}
@@ -208,38 +215,84 @@ function DeviceUploader() {
   );
 }
 
-function uploadViaOurProxy(
+async function chunkedUpload(
   file: File,
-  onProgress: (pct: number) => void
+  onProgress: (pct: number, status: string) => void
 ): Promise<{ id: string; name: string; mimeType: string; size?: string }> {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", "/api/drive/google/upload", true);
-    // Metadata in headers; body is the raw file bytes.
-    xhr.setRequestHeader("Content-Type", file.type || "video/mp4");
-    xhr.setRequestHeader("x-file-name", encodeURIComponent(file.name));
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
-    };
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try {
-          resolve(JSON.parse(xhr.responseText));
-        } catch {
-          reject(new Error("Invalid JSON in upload response"));
-        }
-      } else {
-        let msg = `Upload failed (${xhr.status})`;
-        try {
-          const j = JSON.parse(xhr.responseText);
-          if (j.error) msg = j.error;
-        } catch { /* ignore */ }
-        reject(new Error(msg));
-      }
-    };
-    xhr.onerror = () => reject(new Error("Network error during upload"));
-    xhr.send(file);
+  // Step 1: init a Google resumable session via our backend.
+  const initRes = await fetch("/api/drive/google/upload/init", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      name: file.name,
+      mimeType: file.type || "video/mp4",
+      size: file.size,
+    }),
   });
+  if (!initRes.ok) {
+    const j = await initRes.json().catch(() => ({}));
+    throw new Error(j.error ?? `Init failed (${initRes.status})`);
+  }
+  const { sessionToken } = await initRes.json();
+
+  // Step 2: upload chunks one at a time.
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+
+  for (let i = 0; i < totalChunks; i++) {
+    const start = i * CHUNK_SIZE;
+    const end = Math.min(start + CHUNK_SIZE, file.size);
+    const chunk = file.slice(start, end);
+    const chunkBuffer = await chunk.arrayBuffer();
+
+    const pct = Math.round((start / file.size) * 100);
+    onProgress(pct, `Chunk ${i + 1}/${totalChunks}`);
+
+    const chunkRes = await uploadChunk({
+      sessionToken,
+      chunkBuffer,
+      mimeType: file.type || "video/mp4",
+      rangeStart: start,
+      rangeTotal: file.size,
+    });
+
+    if (chunkRes.done && chunkRes.file) {
+      onProgress(100, "Done");
+      return chunkRes.file;
+    }
+    // 308 incomplete — loop continues
+  }
+
+  throw new Error("Upload ended without receiving final file metadata from Drive");
+}
+
+async function uploadChunk({
+  sessionToken,
+  chunkBuffer,
+  mimeType,
+  rangeStart,
+  rangeTotal,
+}: {
+  sessionToken: string;
+  chunkBuffer: ArrayBuffer;
+  mimeType: string;
+  rangeStart: number;
+  rangeTotal: number;
+}): Promise<{ done: boolean; file?: { id: string; name: string; mimeType: string; size?: string } }> {
+  const res = await fetch("/api/drive/google/upload/chunk", {
+    method: "POST",
+    headers: {
+      "content-type": mimeType,
+      "x-session-token": sessionToken,
+      "x-range-start": String(rangeStart),
+      "x-range-total": String(rangeTotal),
+    },
+    body: chunkBuffer,
+  });
+  if (!res.ok) {
+    const j = await res.json().catch(() => ({}));
+    throw new Error(j.error ?? `Chunk upload failed (${res.status})`);
+  }
+  return res.json();
 }
 
 function formatSize(size?: string) {
